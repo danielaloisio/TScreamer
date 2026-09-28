@@ -22,9 +22,9 @@ TubeScreamerAudioProcessorEditor::TubeScreamerAudioProcessorEditor (
         addAndMakeVisible(label);
     };
 
-    setupKnob(driveKnob, driveLabel, "OLAR");
-    setupKnob(toneKnob,  toneLabel,  "ALLOW");
-    setupKnob(levelKnob, levelLabel, "VIXI");
+    setupKnob(driveKnob, driveLabel, "Drive");
+    setupKnob(toneKnob,  toneLabel,  "Tone");
+    setupKnob(levelKnob, levelLabel, "Level");
 
     // ---- Vincula knobs aos parâmetros ----
     driveSliderAttach = std::make_unique<juce::SliderParameterAttachment>(
