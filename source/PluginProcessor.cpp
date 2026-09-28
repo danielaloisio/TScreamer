@@ -1,186 +1,149 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "PluginEditor.h"
 
-//==============================================================================
-PluginProcessor::PluginProcessor()
-     : AudioProcessor (BusesProperties()
-                     #if ! JucePlugin_IsMidiEffect
-                      #if ! JucePlugin_IsSynth
-                       .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                      #endif
-                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
-                     #endif
-                       )
+// ============================================================
+//  PluginProcessor.cpp  —  Tube Screamer DSP
+// ============================================================
+
+TubeScreamerAudioProcessor::TubeScreamerAudioProcessor()
+    : AudioProcessor (BusesProperties()
+                        .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
+    // Registra os três parâmetros do pedal
+    addParameter (driveParam = new juce::AudioParameterFloat (
+        "drive", "Drive", 0.0f, 1.0f, 0.5f));
+
+    addParameter (toneParam  = new juce::AudioParameterFloat (
+        "tone",  "Tone",  0.0f, 1.0f, 0.5f));
+
+    addParameter (levelParam = new juce::AudioParameterFloat (
+        "level", "Level", 0.0f, 1.0f, 0.7f));
 }
 
-PluginProcessor::~PluginProcessor()
+TubeScreamerAudioProcessor::~TubeScreamerAudioProcessor() {}
+
+// -------------------------------------------------------
+void TubeScreamerAudioProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
 {
-}
+    fs = sampleRate;
 
-//==============================================================================
-const juce::String PluginProcessor::getName() const
-{
-    return JucePlugin_Name;
-}
+    // ---- Coeficiente do low-pass interno do clipper ----
+    // Simula C3 no loop de feedback (~51pF em paralelo com Rf=51k)
+    // fc = 1 / (2*pi*R*C) = 1 / (2*pi * 51k * 51pF) ≈ 61 kHz
+    // (Limita as harmônicas ultra-agudas do clipping)
+    double fc_clip = 61000.0;
+    double wc = 2.0 * juce::MathConstants<double>::pi * fc_clip / sampleRate;
+    lpClipCoef = (float)(1.0 - std::exp(-wc));   // coef do IIR de 1ª ordem
 
-bool PluginProcessor::acceptsMidi() const
-{
-   #if JucePlugin_WantsMidiInput
-    return true;
-   #else
-    return false;
-   #endif
-}
-
-bool PluginProcessor::producesMidi() const
-{
-   #if JucePlugin_ProducesMidiOutput
-    return true;
-   #else
-    return false;
-   #endif
-}
-
-bool PluginProcessor::isMidiEffect() const
-{
-   #if JucePlugin_IsMidiEffect
-    return true;
-   #else
-    return false;
-   #endif
-}
-
-double PluginProcessor::getTailLengthSeconds() const
-{
-    return 0.0;
-}
-
-int PluginProcessor::getNumPrograms()
-{
-    return 1;   // NB: some hosts don't cope very well if you tell them there are 0 programs,
-                // so this should be at least 1, even if you're not really implementing programs.
-}
-
-int PluginProcessor::getCurrentProgram()
-{
-    return 0;
-}
-
-void PluginProcessor::setCurrentProgram (int index)
-{
-    juce::ignoreUnused (index);
-}
-
-const juce::String PluginProcessor::getProgramName (int index)
-{
-    juce::ignoreUnused (index);
-    return {};
-}
-
-void PluginProcessor::changeProgramName (int index, const juce::String& newName)
-{
-    juce::ignoreUnused (index, newName);
-}
-
-//==============================================================================
-void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
-{
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
-    juce::ignoreUnused (sampleRate, samplesPerBlock);
-}
-
-void PluginProcessor::releaseResources()
-{
-    // When playback stops, you can use this as an opportunity to free up any
-    // spare memory, etc.
-}
-
-bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
-{
-  #if JucePlugin_IsMidiEffect
-    juce::ignoreUnused (layouts);
-    return true;
-  #else
-    // This is the place where you check if the layout is supported.
-    // In this template code we only support mono or stereo.
-    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
-     && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
-        return false;
-
-    // This checks if the input layout matches the output layout
-   #if ! JucePlugin_IsSynth
-    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
-        return false;
-   #endif
-
-    return true;
-  #endif
-}
-
-void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
-                                              juce::MidiBuffer& midiMessages)
-{
-    juce::ignoreUnused (midiMessages);
-
-    juce::ScopedNoDenormals noDenormals;
-    auto totalNumInputChannels  = getTotalNumInputChannels();
-    auto totalNumOutputChannels = getTotalNumOutputChannels();
-
-    // In case we have more outputs than inputs, this code clears any output
-    // channels that didn't contain input data, (because these aren't
-    // guaranteed to be empty - they may contain garbage).
-    // This is here to avoid people getting screaming feedback
-    // when they first compile a plugin, but obviously you don't need to keep
-    // this code if your algorithm always overwrites all the output channels.
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear (i, 0, buffer.getNumSamples());
-
-    // This is the place where you'd normally do the guts of your plugin's
-    // audio processing...
-    // Make sure to reset the state if your inner loop is processing
-    // the samples and the outer loop is handling the channels.
-    // Alternatively, you can process the samples with the channels
-    // interleaved by keeping the same state.
-    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    // ---- Zera estados dos filtros ----
+    for (int ch = 0; ch < 2; ++ch)
     {
-        auto* channelData = buffer.getWritePointer (channel);
-        juce::ignoreUnused (channelData);
-        // ..do something to the data...
+        hpX[ch] = hpY[ch] = 0.0f;
+        lpClipX[ch] = lpClipY[ch] = 0.0f;
+        toneX[ch] = toneY[ch] = 0.0f;
+        outHpX[ch] = outHpY[ch] = 0.0f;
     }
 }
 
-//==============================================================================
-bool PluginProcessor::hasEditor() const
+void TubeScreamerAudioProcessor::releaseResources() {}
+
+// -------------------------------------------------------
+void TubeScreamerAudioProcessor::processBlock (
+    juce::AudioBuffer<float>& buffer, juce::MidiBuffer& /*midi*/)
 {
-    return true; // (change this to false if you choose to not supply an editor)
+    juce::ScopedNoDenormals noDenormals;
+
+    const float drive = driveParam->get();   // 0..1
+    const float tone  = toneParam->get();    // 0..1
+    const float level = levelParam->get();   // 0..1
+
+    // ---- Coeficiente do tone filter ----
+    // Simula R_tone + C_tone: pot 20k (0..20k) + C = 0.022uF
+    // Quando tone=0 -> R grande -> fc baixo (escuro)
+    // Quando tone=1 -> R pequeno -> fc alto (brilhante)
+    // fc varia de ~360 Hz a ~7.2 kHz
+    double rTone   = 220.0 + (1.0 - (double)tone) * 20000.0;
+    double cTone   = 0.022e-6;
+    double wTone   = 1.0 / (rTone * cTone);
+    double alphaTone = (float)(wTone / (wTone + 2.0 * fs));  // bilinear
+    float  toneCoef = (float)alphaTone;
+
+    const int numChannels = buffer.getNumChannels();
+    const int numSamples  = buffer.getNumSamples();
+
+    for (int ch = 0; ch < numChannels && ch < 2; ++ch)
+    {
+        float* data = buffer.getWritePointer(ch);
+
+        for (int n = 0; n < numSamples; ++n)
+        {
+            float x = data[n];
+
+            // ---- 1. High-pass de entrada (C1/R1, fc ≈ 338 Hz) ----
+            // Remove DC e frequências abaixo de 338 Hz antes do clipper
+            // Isso é o que dá o "mid-hump" característico do TS
+            float hpOut = hpAlpha * (hpY[ch] + x - hpX[ch]);
+            hpX[ch] = x;
+            hpY[ch] = hpOut;
+
+            // ---- 2. Clipping assimétrico (estágio op-amp + diodos) ----
+            float clipped = tubeSaturate(hpOut, drive);
+
+            // ---- 3. Low-pass do loop de feedback (C3, fc ≈ 61kHz) ----
+            // Suaviza as harmônicas ultra-agudas geradas pelo clipping
+            float lpOut = lpClipY[ch] + lpClipCoef * (clipped - lpClipY[ch]);
+            lpClipY[ch] = lpOut;
+
+            // ---- 4. Tone filter (low-pass variável, R_tone + C4) ----
+            // O TS não tem um treble cut/boost como outros pedais —
+            // ele simplesmente atenua graves antes do clipper (hp) e
+            // agudos depois (este lp), criando o "mid-boost" famoso
+            float toneOut = toneY[ch] + toneCoef * (lpOut - toneY[ch]);
+            toneY[ch] = toneOut;
+
+            // ---- 5. High-pass de saída (remove DC residual) ----
+            float outHp = outHpAlpha * (outHpY[ch] + toneOut - outHpX[ch]);
+            outHpX[ch] = toneOut;
+            outHpY[ch] = outHp;
+
+            // ---- 6. Volume (level pot: 0..500k, saída linear) ----
+            // Curva suave tipo potenciômetro de áudio (log)
+            float vol = level * level * 4.0f;  // 0..4x
+            data[n] = outHp * vol;
+        }
+    }
 }
 
-juce::AudioProcessorEditor* PluginProcessor::createEditor()
+// -------------------------------------------------------
+void TubeScreamerAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    return new PluginEditor (*this);
+    juce::MemoryOutputStream stream (destData, true);
+    stream.writeFloat (*driveParam);
+    stream.writeFloat (*toneParam);
+    stream.writeFloat (*levelParam);
 }
 
-//==============================================================================
-void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
+void TubeScreamerAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    // You should use this method to store your parameters in the memory block.
-    // You could do that either as raw data, or use the XML or ValueTree classes
-    // as intermediaries to make it easy to save and load complex data.
-    juce::ignoreUnused (destData);
+    juce::MemoryInputStream stream (data, (size_t)sizeInBytes, false);
+    *driveParam = stream.readFloat();
+    *toneParam  = stream.readFloat();
+    *levelParam = stream.readFloat();
 }
 
-void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
+// -------------------------------------------------------
+juce::AudioProcessorEditor* TubeScreamerAudioProcessor::createEditor()
 {
-    // You should use this method to restore your parameters from this memory block,
-    // whose contents will have been created by the getStateInformation() call.
-    juce::ignoreUnused (data, sizeInBytes);
+    return new TubeScreamerAudioProcessorEditor (*this);
 }
 
-//==============================================================================
-// This creates new instances of the plugin..
+// -------------------------------------------------------
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new PluginProcessor();
+    return new TubeScreamerAudioProcessor();
 }
+
+// Nota: createEditor() implementado em PluginEditor.cpp
+// mas precisa ser definido aqui para o linker encontrar
